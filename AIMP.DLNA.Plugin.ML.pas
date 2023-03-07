@@ -11,7 +11,6 @@
 unit AIMP.DLNA.Plugin.ML;
 
 {$I AIMP.DLNA.inc}
-{$MESSAGE 'TODO - support for album art thumbnails'}
 
 interface
 
@@ -19,6 +18,7 @@ uses
   Winapi.ActiveX,
   Winapi.Windows,
   // API
+  apiAlbumArt,
   apiObjects,
   apiFileManager,
   apiMusicLibrary,
@@ -43,6 +43,7 @@ type
   TDLNAEntry = record
     Album: string;
     AlbumArtist: string;
+    AlbumArtUrl: string;
     Artist: string;
     Bitrate: Integer;
     Clazz: string;
@@ -60,6 +61,7 @@ type
   { TDLNAMusicLibraryExtension }
 
   TDLNAMusicLibraryExtension = class(TAIMPPropertyList,
+    IAIMPMLAlbumArtProvider2,
     IAIMPMLDataProvider,
     IAIMPMLGroupingTreeDataProvider,
     IAIMPMLExtensionDataStorage,
@@ -68,6 +70,7 @@ type
     BackgroundTaskIdBase = 1000;
     FieldAlbum = 'Album';
     FieldAlbumArtist = 'AlbumArtist';
+    FieldAlbumArtUrl = 'AlbumArtUrl';
     FieldArtist = 'Artist';
     FieldGenre = 'Genre';
     FieldNodeUri = 'NodeUri';
@@ -89,6 +92,10 @@ type
     // IAIMPPropertyList
     procedure DoGetValueAsInt32(PropertyID: Integer; out Value: Integer; var Result: HRESULT); override;
     function DoGetValueAsObject(PropertyID: Integer): IInterface; override;
+
+    // IAIMPMLAlbumArtProvider2
+    function Get(Fields: IAIMPObjectList; Values: POleVariant;
+      Request: IAIMPAlbumArtRequest; out Image: IAIMPImageContainer): HRESULT; stdcall;
 
     // IAIMPMLDataProvider
     function GetData(Fields: IAIMPObjectList; Filter: IAIMPMLDataFilter; out Data: IUnknown): HRESULT; overload; stdcall;
@@ -179,10 +186,12 @@ type
     FCurrent: TDLNAEntry;
     FFieldAlbum: Integer;
     FFieldAlbumArtist: Integer;
+    FFieldAlbumArtUrl: Integer;
     FFieldArtist: Integer;
     FFieldDuration: Integer;
     FFieldFileName: Integer;
     FFieldGenre: Integer;
+    FFieldID: Integer;
     FFieldNodeUri: Integer;
     FFieldSize: Integer;
     FFieldTitle: Integer;
@@ -258,6 +267,7 @@ begin
   Result.Title := ANode.NodeValueByName('dc:title');
   Result.Album := ANode.NodeValueByName('upnp:album');
   Result.AlbumArtist := ANode.NodeValueByName('upnp:albumArtist');
+  Result.AlbumArtUrl := ANode.NodeValueByName('upnp:albumArtURI');
   Result.Artist := ANode.NodeValueByName('upnp:artist');
   Result.Genre := ANode.NodeValueByName('upnp:genre');
   Result.Clazz := ANode.NodeValueByName('upnp:class');
@@ -292,6 +302,33 @@ begin
       Result := MakeString('DLNA');
   else
     Result := inherited DoGetValueAsObject(PropertyID);
+  end;
+end;
+
+function TDLNAMusicLibraryExtension.Get(Fields: IAIMPObjectList; Values: POleVariant;
+  Request: IAIMPAlbumArtRequest; out Image: IAIMPImageContainer): HRESULT; stdcall;
+type
+  TOleVariantArray = array[0..0] of OleVariant;
+  POleVariantArray = ^TOleVariantArray;
+var
+  AAlbumArtUrl: string;
+  AAlbumArtUrlIndex: Integer;
+  AAlbumArtUrlString: IAIMPString;
+begin
+  AAlbumArtUrlIndex := GetFieldIndex(Fields, FieldAlbumArtUrl);
+  if AAlbumArtUrlIndex < 0 then
+    Exit(E_FAIL);
+
+  AAlbumArtUrl := POleVariantArray(Values)^[AAlbumArtUrlIndex];
+  if AAlbumArtUrl = '' then
+    Exit(E_FAIL);
+
+  AAlbumArtUrlString := MakeString(AAlbumArtUrl);
+  Result := Request.CacheGet(AAlbumArtUrlString, Image);
+  if Failed(Result) then
+  begin
+    Result := Request.Download(AAlbumArtUrlString, Image);
+    Request.CachePut(AAlbumArtUrlString, Image);
   end;
 end;
 
@@ -434,8 +471,6 @@ var
   AService: IUPnPService;
 begin
   Result := nil;
-
-  {$MESSAGE 'TODO - cache requests'}
   AService := GetContentDirectoryService;
   if AService <> nil then
   try
@@ -446,10 +481,8 @@ begin
     AParamsIn[3] := 0;
     AParamsIn[4] := 0;
     AParamsIn[5] := '';
-
     AParamsOut := VarArrayCreate([0, 0], varVariant);
     AService.InvokeAction('Browse', AParamsIn, AParamsOut);
-
     ADoc := TACLXMLDocument.Create;
     try
       ADoc.LoadFromString(acEncodeUTF8(AParamsOut[0]));
@@ -514,6 +547,7 @@ begin
         List.Add(CreateField(FieldGenre, AIMPML_FIELDTYPE_STRING, 0));
         List.Add(CreateField(FieldYear, AIMPML_FIELDTYPE_STRING, 0));
         List.Add(CreateField(FieldNodeUri, AIMPML_FIELDTYPE_STRING, AIMPML_FIELDFLAG_INTERNAL));
+        List.Add(CreateField(FieldAlbumArtUrl, AIMPML_FIELDTYPE_STRING, AIMPML_FIELDFLAG_INTERNAL or AIMPML_FIELDFLAG_REQUIRED));
       end;
 
     AIMPML_FIELDS_SCHEMA_TABLE_GROUPBY,
@@ -556,7 +590,10 @@ end;
 procedure TDLNAMusicLibraryExtension.Finalize;
 begin
   if FDeviceFindTaskID <> 0 then
+  begin
     FDeviceFinder.CancelAsyncFind(FDeviceFindTaskID);
+    FDeviceFindTaskID := 0;
+  end;
   FreeAndNil(FDeviceFinder);
   FreeAndNil(FDevices);
   FManager := nil;
@@ -755,8 +792,10 @@ begin
   FNodeUri := ANodeUri;
   FChildren := AChildren;
   FSupportedExts := GetSupportedExts;
+  FFieldID := GetFieldIndex(AFields, AIMPML_RESERVED_FIELD_ID);
   FFieldAlbum := GetFieldIndex(AFields, TDLNAMusicLibraryExtension.FieldAlbum);
   FFieldAlbumArtist := GetFieldIndex(AFields, TDLNAMusicLibraryExtension.FieldAlbumArtist);
+  FFieldAlbumArtUrl := GetFieldIndex(AFields, TDLNAMusicLibraryExtension.FieldAlbumArtUrl);
   FFieldArtist := GetFieldIndex(AFields, TDLNAMusicLibraryExtension.FieldArtist);
   FFieldGenre := GetFieldIndex(AFields, TDLNAMusicLibraryExtension.FieldGenre);
   FFieldTitle := GetFieldIndex(AFields, TDLNAMusicLibraryExtension.FieldTitle);
@@ -799,10 +838,14 @@ end;
 
 function TDLNADataProvider.GetValueAsString(FieldIndex: Integer): string;
 begin
-  if FieldIndex = FFieldAlbum then
+  if FieldIndex = FFieldID then
+    Result := FCurrent.ID
+  else if FieldIndex = FFieldAlbum then
     Result := FCurrent.Album
   else if FieldIndex = FFieldAlbumArtist then
     Result := FCurrent.AlbumArtist
+  else if FieldIndex = FFieldAlbumArtUrl then
+    Result := FCurrent.AlbumArtUrl
   else if FieldIndex = FFieldArtist then
     Result := FCurrent.Artist
   else if FieldIndex = FFieldFileName then
