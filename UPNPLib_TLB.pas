@@ -48,7 +48,7 @@ unit UPNPLib_TLB;
 {$ALIGN 4}
 interface
 
-uses Windows, ActiveX, Classes, Graphics, OleServer, StdVCL, Variants;
+uses Windows, ActiveX, Classes, OleServer, Variants;
   
 
 // *********************************************************************//
